@@ -1,0 +1,849 @@
+name: Build FinTracker APK
+
+# Berjalan otomatis setiap ada perubahan di repo,
+# atau manual lewat tab Actions > Build FinTracker APK > Run workflow.
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Ambil isi repo
+        uses: actions/checkout@v4
+
+      - name: Periksa index.html
+        run: |
+          if [ ! -f index.html ]; then
+            echo "::error::index.html belum ada di folder utama repo. Upload index.html, lalu jalankan ulang."
+            exit 1
+          fi
+          if ! grep -q "Android.updateWidget" index.html; then
+            echo "::error::index.html ini belum versi yang terhubung ke widget. Pakai index.html dari Claude."
+            exit 1
+          fi
+
+      - name: Pasang Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Pasang Gradle 8.9
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.9'
+
+      - name: Rakit proyek Android
+        run: |
+          set -e
+          P=android-project
+          mkdir -p "$P/app"
+          cat > "$P/app/build.gradle" <<'FT_EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.example.financialtracker'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.example.financialtracker'
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+
+          dependencies {
+              // Dialog biometrik asli Android (BiometricPrompt) untuk fitur Gunakan Sidik Jari
+              implementation 'androidx.biometric:biometric:1.1.0'
+              // Dipakai langsung oleh MainActivity (FragmentActivity); dideklarasikan eksplisit agar pasti terbaca saat kompilasi
+              implementation 'androidx.fragment:fragment:1.2.5'
+          }
+          FT_EOF
+          mkdir -p "$P/app/src/main"
+          cat > "$P/app/src/main/AndroidManifest.xml" <<'FT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <!-- Sengaja TANPA izin INTERNET: aplikasi ini 100% offline -->
+
+              <!-- Izin biometrik (izin biasa, tanpa akses jaringan) untuk fitur Gunakan Sidik Jari -->
+              <uses-permission android:name="android.permission.USE_BIOMETRIC" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout"
+                      android:exported="true"
+                      android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <receiver
+                      android:name=".BalanceWidgetProvider"
+                      android:exported="false">
+                      <intent-filter>
+                          <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.appwidget.provider"
+                          android:resource="@xml/balance_widget_info" />
+                  </receiver>
+              </application>
+
+          </manifest>
+          FT_EOF
+          mkdir -p "$P/app/src/main/java/com/example/financialtracker"
+          cat > "$P/app/src/main/java/com/example/financialtracker/BalanceWidgetProvider.java" <<'FT_EOF'
+          package com.example.financialtracker;
+
+          import android.app.PendingIntent;
+          import android.appwidget.AppWidgetManager;
+          import android.appwidget.AppWidgetProvider;
+          import android.content.ComponentName;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.widget.RemoteViews;
+
+          /**
+           * Widget layar beranda "Sisa Saldo".
+           * Datanya dibaca dari SharedPreferences yang diisi oleh MainActivity
+           * (yang menerima kiriman dari JavaScript di index.html). Tanpa internet.
+           */
+          public class BalanceWidgetProvider extends AppWidgetProvider {
+
+              public static final String PREFS_NAME = "financial_tracker_widget";
+              public static final String KEY_BALANCE = "balance_text";
+
+              private static final int COLOR_NORMAL = 0xFFFFFFFF;
+              private static final int COLOR_NEGATIVE = 0xFFFFD1D9;
+
+              /** Dipanggil sistem saat widget pertama kali dipasang atau perlu digambar ulang. */
+              @Override
+              public void onUpdate(Context context, AppWidgetManager manager, int[] appWidgetIds) {
+                  for (int id : appWidgetIds) {
+                      manager.updateAppWidget(id, buildViews(context));
+                  }
+              }
+
+              /** Dipanggil MainActivity setiap kali saldo berubah, supaya semua widget ikut diperbarui. */
+              public static void refreshAll(Context context) {
+                  AppWidgetManager manager = AppWidgetManager.getInstance(context);
+                  ComponentName component = new ComponentName(context, BalanceWidgetProvider.class);
+                  int[] ids = manager.getAppWidgetIds(component);
+                  for (int id : ids) {
+                      manager.updateAppWidget(id, buildViews(context));
+                  }
+              }
+
+              private static RemoteViews buildViews(Context context) {
+                  SharedPreferences prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+                  String balance = prefs.getString(KEY_BALANCE, "Rp 0");
+
+                  RemoteViews views = new RemoteViews(context.getPackageName(), R.layout.widget_balance);
+                  views.setTextViewText(R.id.widget_balance, balance);
+                  views.setTextColor(R.id.widget_balance, balance.startsWith("-") ? COLOR_NEGATIVE : COLOR_NORMAL);
+
+                  // Ketuk widget untuk membuka aplikasi
+                  Intent openApp = new Intent(context, MainActivity.class);
+                  PendingIntent pending = PendingIntent.getActivity(
+                          context, 0, openApp,
+                          PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE);
+                  views.setOnClickPendingIntent(R.id.widget_root, pending);
+
+                  return views;
+              }
+          }
+          FT_EOF
+          mkdir -p "$P/app/src/main/java/com/example/financialtracker"
+          cat > "$P/app/src/main/java/com/example/financialtracker/MainActivity.java" <<'FT_EOF'
+          package com.example.financialtracker;
+
+          import android.annotation.SuppressLint;
+          import android.content.Context;
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import android.view.WindowInsets;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+
+          import androidx.fragment.app.FragmentActivity;
+
+          /**
+           * Membuka index.html dari folder assets di dalam WebView (100% offline)
+           * dan menyediakan jembatan "window.Android" untuk JavaScript.
+           * Memakai FragmentActivity karena BiometricPrompt (login sidik jari) membutuhkannya.
+           */
+          public class MainActivity extends FragmentActivity {
+
+              private static final String BG_COLOR = "#0f1420";
+              private static final int MAX_TEXT_LENGTH = 40;
+
+              private WebView webView;
+
+              @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  int bg = Color.parseColor(BG_COLOR);
+                  getWindow().getDecorView().setBackgroundColor(bg);
+                  getWindow().setStatusBarColor(bg);
+                  getWindow().setNavigationBarColor(bg);
+
+                  webView = new WebView(this);
+                  webView.setBackgroundColor(bg);
+                  setContentView(webView);
+
+                  // Beri ruang untuk status bar / navigation bar (HP Android baru memakai layar penuh)
+                  webView.setOnApplyWindowInsetsListener((view, insets) -> {
+                      view.setPadding(
+                              insets.getSystemWindowInsetLeft(),
+                              insets.getSystemWindowInsetTop(),
+                              insets.getSystemWindowInsetRight(),
+                              insets.getSystemWindowInsetBottom());
+                      return insets;
+                  });
+
+                  WebSettings settings = webView.getSettings();
+                  settings.setJavaScriptEnabled(true);
+                  settings.setDomStorageEnabled(true); // supaya localStorage berfungsi
+
+                  // Hanya halaman lokal yang boleh dibuka
+                  webView.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+                          return !request.getUrl().toString().startsWith("file:///android_asset/");
+                      }
+                  });
+
+                  webView.addJavascriptInterface(
+                          new WidgetBridge(getApplicationContext(), new BiometricHelper(this, webView)), "Android");
+                  webView.loadUrl("file:///android_asset/index.html");
+              }
+
+              @Override
+              protected void onDestroy() {
+                  if (webView != null) {
+                      webView.destroy();
+                      webView = null;
+                  }
+                  super.onDestroy();
+              }
+
+              /** Jembatan yang dipanggil dari JavaScript: window.Android.updateWidget("Rp 150.000") */
+              private static class WidgetBridge {
+                  private final Context appContext;
+                  private final BiometricHelper bio;
+
+                  WidgetBridge(Context appContext, BiometricHelper bio) {
+                      this.appContext = appContext;
+                      this.bio = bio;
+                  }
+
+                  @JavascriptInterface
+                  public void updateWidget(String balanceText) {
+                      if (balanceText == null) {
+                          return;
+                      }
+                      String text = balanceText.trim();
+                      if (text.length() > MAX_TEXT_LENGTH) {
+                          text = text.substring(0, MAX_TEXT_LENGTH);
+                      }
+                      appContext.getSharedPreferences(BalanceWidgetProvider.PREFS_NAME, Context.MODE_PRIVATE)
+                              .edit()
+                              .putString(BalanceWidgetProvider.KEY_BALANCE, text)
+                              .apply();
+                      BalanceWidgetProvider.refreshAll(appContext);
+                  }
+
+                  /** Status sidik jari: "enabled", "ready", "no_enrolled" atau "unsupported". */
+                  @JavascriptInterface
+                  public String bioStatus() {
+                      return bio.status();
+                  }
+
+                  /** Aktifkan sidik jari (wajib konfirmasi biometrik). Hasil dikirim lewat window.__ftBioDone. */
+                  @JavascriptInterface
+                  public void bioEnable(String dekBase64) {
+                      bio.enable(dekBase64);
+                  }
+
+                  /** Login dengan sidik jari. Hasil dikirim lewat window.__ftBioDone. */
+                  @JavascriptInterface
+                  public void bioUnlock() {
+                      bio.unlock();
+                  }
+
+                  /** Nonaktifkan sidik jari. Data keuangan dan kata sandi tidak disentuh. */
+                  @JavascriptInterface
+                  public void bioDisable() {
+                      bio.disable();
+                  }
+              }
+          }
+          FT_EOF
+          mkdir -p "$P/app/src/main/java/com/example/financialtracker"
+          cat > "$P/app/src/main/java/com/example/financialtracker/BiometricHelper.java" <<'FT_EOF'
+          package com.example.financialtracker;
+
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.os.Build;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.security.keystore.KeyGenParameterSpec;
+          import android.security.keystore.KeyProperties;
+          import android.util.Base64;
+          import android.webkit.WebView;
+
+          import androidx.biometric.BiometricManager;
+          import androidx.biometric.BiometricPrompt;
+          import androidx.fragment.app.FragmentActivity;
+
+          import org.json.JSONObject;
+
+          import java.security.InvalidKeyException;
+          import java.security.KeyStore;
+          import java.security.UnrecoverableKeyException;
+          import java.util.Arrays;
+          import java.util.concurrent.Executor;
+
+          import javax.crypto.Cipher;
+          import javax.crypto.KeyGenerator;
+          import javax.crypto.SecretKey;
+          import javax.crypto.spec.GCMParameterSpec;
+
+          /**
+           * Login sidik jari (opsional) untuk FinTracker.
+           *
+           * Cara kerja:
+           * - Kunci data FinTracker (DEK, 32 byte) tetap dibuat dan dipakai oleh JavaScript di index.html.
+           * - Saat sidik jari diaktifkan, DEK dienkripsi dengan kunci AES milik Android Keystore. Kunci itu
+           *   hanya bisa dipakai SETELAH sidik jari sah lewat BiometricPrompt (CryptoObject), dan otomatis
+           *   hangus jika ada sidik jari baru didaftarkan di perangkat.
+           * - Yang disimpan di SharedPreferences hanya hasil enkripsi (IV + ciphertext), bukan DEK maupun
+           *   kata sandi. Tanpa sidik jari sah, isinya tidak bisa dibuka.
+           * - Saat login, sidik jari yang sah membuka DEK asli, lalu DEK itu dikirim ke JavaScript untuk
+           *   membuka data terenkripsi yang sudah ada. Jika DEK salah, data tetap tidak terbuka.
+           *
+           * Semua hasil dikirim balik ke JavaScript lewat window.__ftBioDone(op, code, data).
+           * Kode hasil: ok, cancel, lockout, unavailable, invalid, error.
+           */
+          final class BiometricHelper {
+
+              private static final String KEYSTORE = "AndroidKeyStore";
+              private static final String KEY_ALIAS = "financial_tracker_bio_key";
+              private static final String PREFS_NAME = "financial_tracker_bio";
+              private static final String PREF_IV = "iv";
+              private static final String PREF_CT = "ct";
+              private static final String TRANSFORMATION = "AES/GCM/NoPadding";
+              private static final int GCM_TAG_BITS = 128;
+              private static final int DEK_BYTES = 32;
+              private static final int AUTHENTICATORS = BiometricManager.Authenticators.BIOMETRIC_STRONG;
+
+              private static final String OP_ENABLE = "bioEnable";
+              private static final String OP_UNLOCK = "bioUnlock";
+
+              private final FragmentActivity activity;
+              private final WebView webView;
+              private final Handler mainHandler = new Handler(Looper.getMainLooper());
+              private final Executor mainExecutor = mainHandler::post;
+
+              BiometricHelper(FragmentActivity activity, WebView webView) {
+                  this.activity = activity;
+                  this.webView = webView;
+              }
+
+              // ---------------------------------------------------------------------------------------------
+              // Dipanggil dari WidgetBridge (thread JavaScript). Yang butuh layar dipindah ke thread utama.
+              // ---------------------------------------------------------------------------------------------
+
+              /** "enabled" = sudah aktif, "ready" = bisa diaktifkan, "no_enrolled" = belum ada sidik jari, "unsupported" = tidak tersedia. */
+              String status() {
+                  if (hasEnabledState()) {
+                      return "enabled";
+                  }
+                  int can = BiometricManager.from(activity).canAuthenticate(AUTHENTICATORS);
+                  if (can == BiometricManager.BIOMETRIC_SUCCESS) {
+                      return "ready";
+                  }
+                  if (can == BiometricManager.BIOMETRIC_ERROR_NONE_ENROLLED) {
+                      return "no_enrolled";
+                  }
+                  return "unsupported";
+              }
+
+              /** Aktifkan: dekBase64 = kunci data (32 byte, Base64) dari JavaScript. Wajib konfirmasi sidik jari. */
+              void enable(String dekBase64) {
+                  final byte[] dek = decodeDek(dekBase64);
+                  if (dek == null) {
+                      reply(OP_ENABLE, "error", "");
+                      return;
+                  }
+                  activity.runOnUiThread(() -> doEnable(dek));
+              }
+
+              /** Login: tampilkan BiometricPrompt, lalu kirim DEK asli ke JavaScript jika sidik jari sah. */
+              void unlock() {
+                  activity.runOnUiThread(this::doUnlock);
+              }
+
+              /** Nonaktifkan: hapus kunci Keystore dan data tersimpan. Data keuangan dan kata sandi tidak disentuh. */
+              void disable() {
+                  clearAll();
+              }
+
+              // ---------------------------------------------------------------------------------------------
+              // Thread utama
+              // ---------------------------------------------------------------------------------------------
+
+              private void doEnable(final byte[] dek) {
+                  if (BiometricManager.from(activity).canAuthenticate(AUTHENTICATORS) != BiometricManager.BIOMETRIC_SUCCESS) {
+                      wipe(dek);
+                      reply(OP_ENABLE, "unavailable", "");
+                      return;
+                  }
+
+                  final Cipher cipher;
+                  try {
+                      clearAll(); // mulai dari keadaan bersih
+                      createKey();
+                      cipher = Cipher.getInstance(TRANSFORMATION);
+                      cipher.init(Cipher.ENCRYPT_MODE, loadKey());
+                  } catch (Exception e) {
+                      clearAll();
+                      wipe(dek);
+                      reply(OP_ENABLE, "error", "");
+                      return;
+                  }
+
+                  try {
+                      BiometricPrompt prompt = new BiometricPrompt(activity, mainExecutor, new BiometricPrompt.AuthenticationCallback() {
+                          @Override
+                          public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
+                              try {
+                                  Cipher c = result.getCryptoObject().getCipher();
+                                  byte[] ct = c.doFinal(dek);
+                                  byte[] iv = c.getIV();
+                                  boolean saved = prefs().edit()
+                                          .putString(PREF_IV, Base64.encodeToString(iv, Base64.NO_WRAP))
+                                          .putString(PREF_CT, Base64.encodeToString(ct, Base64.NO_WRAP))
+                                          .commit();
+                                  if (!saved) {
+                                      throw new IllegalStateException("simpan gagal");
+                                  }
+                                  reply(OP_ENABLE, "ok", "");
+                              } catch (Exception e) {
+                                  clearAll();
+                                  reply(OP_ENABLE, "error", "");
+                              } finally {
+                                  wipe(dek);
+                              }
+                          }
+
+                          @Override
+                          public void onAuthenticationError(int errorCode, CharSequence errString) {
+                              clearAll();
+                              wipe(dek);
+                              reply(OP_ENABLE, mapError(errorCode), "");
+                          }
+                      });
+                      prompt.authenticate(
+                              promptInfo("Aktifkan login sidik jari", "Pindai sidik jari untuk mengonfirmasi.", "Batal"),
+                              new BiometricPrompt.CryptoObject(cipher));
+                  } catch (Exception e) {
+                      clearAll();
+                      wipe(dek);
+                      reply(OP_ENABLE, "error", "");
+                  }
+              }
+
+              private void doUnlock() {
+                  if (!hasEnabledState()) {
+                      reply(OP_UNLOCK, "invalid", "");
+                      return;
+                  }
+                  if (BiometricManager.from(activity).canAuthenticate(AUTHENTICATORS) != BiometricManager.BIOMETRIC_SUCCESS) {
+                      reply(OP_UNLOCK, "unavailable", "");
+                      return;
+                  }
+
+                  final byte[] iv;
+                  final byte[] ct;
+                  try {
+                      SharedPreferences p = prefs();
+                      iv = Base64.decode(p.getString(PREF_IV, ""), Base64.NO_WRAP);
+                      ct = Base64.decode(p.getString(PREF_CT, ""), Base64.NO_WRAP);
+                  } catch (IllegalArgumentException e) {
+                      clearAll();
+                      reply(OP_UNLOCK, "invalid", "");
+                      return;
+                  }
+
+                  final Cipher cipher;
+                  try {
+                      cipher = Cipher.getInstance(TRANSFORMATION);
+                      cipher.init(Cipher.DECRYPT_MODE, loadKey(), new GCMParameterSpec(GCM_TAG_BITS, iv));
+                  } catch (InvalidKeyException | UnrecoverableKeyException e) {
+                      // Termasuk KeyPermanentlyInvalidatedException (sidik jari di perangkat berubah) atau kunci hilang
+                      clearAll();
+                      reply(OP_UNLOCK, "invalid", "");
+                      return;
+                  } catch (Exception e) {
+                      reply(OP_UNLOCK, "error", "");
+                      return;
+                  }
+
+                  try {
+                      BiometricPrompt prompt = new BiometricPrompt(activity, mainExecutor, new BiometricPrompt.AuthenticationCallback() {
+                          @Override
+                          public void onAuthenticationSucceeded(BiometricPrompt.AuthenticationResult result) {
+                              byte[] dek = null;
+                              try {
+                                  dek = result.getCryptoObject().getCipher().doFinal(ct);
+                                  reply(OP_UNLOCK, "ok", Base64.encodeToString(dek, Base64.NO_WRAP));
+                              } catch (Exception e) {
+                                  // Data tersimpan rusak: bersihkan. Kata sandi tetap bisa dipakai.
+                                  clearAll();
+                                  reply(OP_UNLOCK, "invalid", "");
+                              } finally {
+                                  if (dek != null) {
+                                      wipe(dek);
+                                  }
+                              }
+                          }
+
+                          @Override
+                          public void onAuthenticationError(int errorCode, CharSequence errString) {
+                              reply(OP_UNLOCK, mapError(errorCode), "");
+                          }
+                      });
+                      prompt.authenticate(
+                              promptInfo("Masuk ke FinTracker", "Gunakan sidik jari yang terdaftar di perangkat ini.", "Gunakan kata sandi"),
+                              new BiometricPrompt.CryptoObject(cipher));
+                  } catch (Exception e) {
+                      reply(OP_UNLOCK, "error", "");
+                  }
+              }
+
+              // ---------------------------------------------------------------------------------------------
+              // Utilitas
+              // ---------------------------------------------------------------------------------------------
+
+              private static BiometricPrompt.PromptInfo promptInfo(String title, String subtitle, String negativeText) {
+                  return new BiometricPrompt.PromptInfo.Builder()
+                          .setTitle(title)
+                          .setSubtitle(subtitle)
+                          .setNegativeButtonText(negativeText)
+                          .setAllowedAuthenticators(AUTHENTICATORS)
+                          .build();
+              }
+
+              private static String mapError(int code) {
+                  switch (code) {
+                      case BiometricPrompt.ERROR_USER_CANCELED:
+                      case BiometricPrompt.ERROR_NEGATIVE_BUTTON:
+                      case BiometricPrompt.ERROR_CANCELED:
+                          return "cancel";
+                      case BiometricPrompt.ERROR_LOCKOUT:
+                      case BiometricPrompt.ERROR_LOCKOUT_PERMANENT:
+                          return "lockout";
+                      case BiometricPrompt.ERROR_NO_BIOMETRICS:
+                      case BiometricPrompt.ERROR_HW_NOT_PRESENT:
+                      case BiometricPrompt.ERROR_HW_UNAVAILABLE:
+                          return "unavailable";
+                      default:
+                          return "error";
+                  }
+              }
+
+              /** Kunci AES-256 di Android Keystore: hanya bisa dipakai setelah sidik jari sah, hangus jika sidik jari baru didaftarkan. */
+              private static void createKey() throws Exception {
+                  KeyGenerator generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, KEYSTORE);
+                  KeyGenParameterSpec.Builder spec = new KeyGenParameterSpec.Builder(
+                          KEY_ALIAS, KeyProperties.PURPOSE_ENCRYPT | KeyProperties.PURPOSE_DECRYPT)
+                          .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+                          .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+                          .setKeySize(256)
+                          .setUserAuthenticationRequired(true)
+                          .setInvalidatedByBiometricEnrollment(true);
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                      // Android 11+: wajib sidik jari/biometrik kuat untuk SETIAP pemakaian kunci
+                      spec.setUserAuthenticationParameters(0, KeyProperties.AUTH_BIOMETRIC_STRONG);
+                  }
+                  // Android 8-10: bawaan setUserAuthenticationRequired(true) tanpa durasi = wajib untuk setiap pemakaian
+                  generator.init(spec.build());
+                  generator.generateKey();
+              }
+
+              private static SecretKey loadKey() throws Exception {
+                  KeyStore ks = KeyStore.getInstance(KEYSTORE);
+                  ks.load(null);
+                  return (SecretKey) ks.getKey(KEY_ALIAS, null);
+              }
+
+              private SharedPreferences prefs() {
+                  return activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+              }
+
+              private boolean hasEnabledState() {
+                  SharedPreferences p = prefs();
+                  if (!p.contains(PREF_IV) || !p.contains(PREF_CT)) {
+                      return false;
+                  }
+                  try {
+                      KeyStore ks = KeyStore.getInstance(KEYSTORE);
+                      ks.load(null);
+                      if (ks.containsAlias(KEY_ALIAS)) {
+                          return true;
+                      }
+                  } catch (Exception e) {
+                      return false; // Keystore bermasalah sementara: jangan hapus apa pun
+                  }
+                  clearAll(); // data tersimpan tanpa kunci (mis. hasil restore backup): tidak bisa dipakai, bersihkan
+                  return false;
+              }
+
+              private void clearAll() {
+                  prefs().edit().remove(PREF_IV).remove(PREF_CT).commit();
+                  try {
+                      KeyStore ks = KeyStore.getInstance(KEYSTORE);
+                      ks.load(null);
+                      if (ks.containsAlias(KEY_ALIAS)) {
+                          ks.deleteEntry(KEY_ALIAS);
+                      }
+                  } catch (Exception e) {
+                      // abaikan: tanpa data tersimpan, kunci yang tersisa tidak berguna
+                  }
+              }
+
+              private static byte[] decodeDek(String s) {
+                  if (s == null) {
+                      return null;
+                  }
+                  try {
+                      byte[] b = Base64.decode(s, Base64.NO_WRAP);
+                      if (b.length == DEK_BYTES) {
+                          return b;
+                      }
+                      wipe(b);
+                  } catch (IllegalArgumentException e) {
+                      // format tidak valid
+                  }
+                  return null;
+              }
+
+              private static void wipe(byte[] b) {
+                  Arrays.fill(b, (byte) 0);
+              }
+
+              /** Kirim hasil ke JavaScript. JSONObject.quote membuat string aman untuk disisipkan ke skrip. */
+              private void reply(String op, String code, String data) {
+                  final String js = "window.__ftBioDone&&window.__ftBioDone("
+                          + JSONObject.quote(op) + "," + JSONObject.quote(code) + "," + JSONObject.quote(data) + ")";
+                  activity.runOnUiThread(() -> {
+                      if (activity.isFinishing() || activity.isDestroyed()) {
+                          return;
+                      }
+                      webView.evaluateJavascript(js, null);
+                  });
+              }
+          }
+          FT_EOF
+          mkdir -p "$P/app/src/main/res/drawable"
+          cat > "$P/app/src/main/res/drawable/ic_launcher_foreground.xml" <<'FT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M30,66 h10 v12 h-10 z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M49,52 h10 v26 h-10 z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M68,36 h10 v42 h-10 z" />
+          </vector>
+          FT_EOF
+          mkdir -p "$P/app/src/main/res/drawable"
+          cat > "$P/app/src/main/res/drawable/widget_bg.xml" <<'FT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android"
+              android:shape="rectangle">
+              <gradient
+                  android:angle="315"
+                  android:endColor="#7C3AED"
+                  android:startColor="#4F46E5"
+                  android:type="linear" />
+              <corners android:radius="20dp" />
+          </shape>
+          FT_EOF
+          mkdir -p "$P/app/src/main/res/layout"
+          cat > "$P/app/src/main/res/layout/widget_balance.xml" <<'FT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/widget_root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@drawable/widget_bg"
+              android:gravity="center_vertical"
+              android:orientation="vertical"
+              android:padding="12dp">
+
+              <TextView
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:text="@string/widget_label"
+                  android:textColor="#CCFFFFFF"
+                  android:textSize="12sp" />
+
+              <TextView
+                  android:id="@+id/widget_balance"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="2dp"
+                  android:autoSizeMaxTextSize="26sp"
+                  android:autoSizeMinTextSize="12sp"
+                  android:autoSizeStepGranularity="1sp"
+                  android:autoSizeTextType="uniform"
+                  android:maxLines="1"
+                  android:text="@string/widget_default_balance"
+                  android:textColor="#FFFFFF"
+                  android:textSize="22sp"
+                  android:textStyle="bold" />
+          </LinearLayout>
+          FT_EOF
+          mkdir -p "$P/app/src/main/res/mipmap-anydpi-v26"
+          cat > "$P/app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml" <<'FT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          FT_EOF
+          mkdir -p "$P/app/src/main/res/values"
+          cat > "$P/app/src/main/res/values/colors.xml" <<'FT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="ic_launcher_background">#4F46E5</color>
+          </resources>
+          FT_EOF
+          mkdir -p "$P/app/src/main/res/values"
+          cat > "$P/app/src/main/res/values/strings.xml" <<'FT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">FinTracker</string>
+          </resources>
+          FT_EOF
+          mkdir -p "$P/app/src/main/res/values"
+          cat > "$P/app/src/main/res/values/widget_strings.xml" <<'FT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="widget_label">Sisa Saldo</string>
+              <string name="widget_default_balance">Rp 0</string>
+              <string name="widget_description">Menampilkan sisa saldo FinTracker</string>
+          </resources>
+          FT_EOF
+          mkdir -p "$P/app/src/main/res/xml"
+          cat > "$P/app/src/main/res/xml/balance_widget_info.xml" <<'FT_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/widget_description"
+              android:initialLayout="@layout/widget_balance"
+              android:minWidth="110dp"
+              android:minHeight="110dp"
+              android:minResizeWidth="110dp"
+              android:minResizeHeight="40dp"
+              android:resizeMode="horizontal|vertical"
+              android:updatePeriodMillis="0" />
+          FT_EOF
+          mkdir -p "$P"
+          cat > "$P/build.gradle" <<'FT_EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          FT_EOF
+          mkdir -p "$P"
+          cat > "$P/gradle.properties" <<'FT_EOF'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          android.useAndroidX=true
+          FT_EOF
+          mkdir -p "$P"
+          cat > "$P/settings.gradle" <<'FT_EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "FinancialTracker"
+          include ':app'
+          FT_EOF
+          mkdir -p "$P/app/src/main/assets"
+          cp index.html "$P/app/src/main/assets/index.html"
+          find "$P" -type f | sort
+
+      - name: Bangun APK
+        working-directory: android-project
+        run: gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Siapkan file APK
+        run: |
+          cp android-project/app/build/outputs/apk/debug/app-debug.apk FinTracker.apk
+          ls -l FinTracker.apk
+
+      - name: Simpan APK sebagai artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FinTracker-APK
+          path: FinTracker.apk
+
+      - name: Terbitkan APK di halaman Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "build-${{ github.run_number }}" FinTracker.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "FinTracker - build ${{ github.run_number }}" \
+            --notes "APK debug FinTracker dengan widget Sisa Saldo."
