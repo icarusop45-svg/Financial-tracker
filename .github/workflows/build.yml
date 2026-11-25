@@ -27,6 +27,10 @@ jobs:
             echo "::error::index.html ini belum versi yang terhubung ke widget. Pakai index.html dari Claude."
             exit 1
           fi
+          if [ ! -f app-icon.png ]; then
+            echo "::error::app-icon.png belum ada di folder utama repo. Upload file logo FinTracker ini, lalu jalankan ulang."
+            exit 1
+          fi
 
       - name: Pasang Java 17
         uses: actions/setup-java@v4
@@ -677,25 +681,9 @@ jobs:
               }
           }
           FT_EOF
-          mkdir -p "$P/app/src/main/res/drawable"
-          cat > "$P/app/src/main/res/drawable/ic_launcher_foreground.xml" <<'FT_EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <vector xmlns:android="http://schemas.android.com/apk/res/android"
-              android:width="108dp"
-              android:height="108dp"
-              android:viewportWidth="108"
-              android:viewportHeight="108">
-              <path
-                  android:fillColor="#FFFFFF"
-                  android:pathData="M30,66 h10 v12 h-10 z" />
-              <path
-                  android:fillColor="#FFFFFF"
-                  android:pathData="M49,52 h10 v26 h-10 z" />
-              <path
-                  android:fillColor="#FFFFFF"
-                  android:pathData="M68,36 h10 v42 h-10 z" />
-          </vector>
-          FT_EOF
+          # Gunakan logo PNG dari root repository sebagai foreground adaptive icon.
+          mkdir -p "$P/app/src/main/res/drawable-nodpi"
+          cp app-icon.png "$P/app/src/main/res/drawable-nodpi/ic_launcher_foreground.png"
           mkdir -p "$P/app/src/main/res/drawable"
           cat > "$P/app/src/main/res/drawable/widget_bg.xml" <<'FT_EOF'
           <?xml version="1.0" encoding="utf-8"?>
